@@ -11,4 +11,4 @@ clean:
 	rm -rf build
 
 benchmark: hash_join
-	python3 benchmark.py
+	python3 test.py
