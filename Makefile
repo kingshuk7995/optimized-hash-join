@@ -1,8 +1,19 @@
-run: hash_join
-	./build/hash_join $(ARGS)
+.PHONY: all run clean test
 
-hash_join: build
-	gcc -O3 -march=native -funroll-loops -flto -o build/hash_join hash_join.c -luring
+CC = gcc
+CFLAGS = -O3 -march=native -funroll-loops -flto
+LDFLAGS = -luring
+
+TARGET = build/hash_join
+SRC = hash_join.c
+
+all: $(TARGET)
+
+run: $(TARGET)
+	./$(TARGET) $(ARGS)
+
+$(TARGET): $(SRC) | build
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 build:
 	mkdir -p build
@@ -10,5 +21,5 @@ build:
 clean:
 	rm -rf build
 
-benchmark: hash_join
+test: $(TARGET)
 	python3 test.py
