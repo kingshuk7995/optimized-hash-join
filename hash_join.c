@@ -18,6 +18,9 @@
 #define ALIGNMENT 4096
 #define QUEUE_DEPTH 16
 
+#define likely(x) __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+
 typedef struct {
   const char *data;
   size_t len;
@@ -54,31 +57,49 @@ static inline void flush_out() {
 }
 
 static inline void write_out(const char *data, size_t len) {
-  if (out_pos + len > OUT_BUF_SIZE)
+  if (unlikely(len >= OUT_BUF_SIZE)) {
+    flush_out();
+    if (write(STDOUT_FILENO, data, len) == -1) {
+      perror("write large chunk");
+      exit(EXIT_FAILURE);
+    }
+    return;
+  }
+  if (unlikely(out_pos + len > OUT_BUF_SIZE))
     flush_out();
   memcpy(out_buf + out_pos, data, len);
   out_pos += len;
 }
 
 static inline void write_char(char c) {
-  if (out_pos + 1 > OUT_BUF_SIZE)
+  if (unlikely(out_pos + 1 > OUT_BUF_SIZE))
     flush_out();
   out_buf[out_pos++] = c;
 }
 
 // --- SIMD CSV Parsing & Hashing ---
-__attribute__((target("avx2,popcnt"))) size_t count_rows_simd(const char *ptr,
-                                                              size_t size) {
+
+// Optimized with native SIMD reduction (_mm256_sad_epu8)
+__attribute__((target("avx2"))) size_t count_rows_simd(const char *ptr,
+                                                       size_t size) {
   size_t count = 0;
   const char *end = ptr + size;
   __m256i newlines = _mm256_set1_epi8('\n');
+  __m256i ones = _mm256_set1_epi8(1);
+  __m256i sum = _mm256_setzero_si256();
 
   while (ptr + 32 <= end) {
     __m256i chunk = _mm256_loadu_si256((const __m256i *)ptr);
-    uint32_t mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, newlines));
-    count += __builtin_popcount(mask);
+    __m256i cmp = _mm256_cmpeq_epi8(chunk, newlines);
+    cmp = _mm256_and_si256(cmp, ones); // Isolate 1s
+    sum = _mm256_add_epi64(sum, _mm256_sad_epu8(cmp, _mm256_setzero_si256()));
     ptr += 32;
   }
+
+  uint64_t counts[4];
+  _mm256_storeu_si256((__m256i *)counts, sum);
+  count += counts[0] + counts[1] + counts[2] + counts[3];
+
   while (ptr < end) {
     if (*ptr == '\n')
       count++;
@@ -89,63 +110,92 @@ __attribute__((target("avx2,popcnt"))) size_t count_rows_simd(const char *ptr,
   return count;
 }
 
+// RFC 4180 Compliant with SIMD Fast Path
 __attribute__((target("avx2"))) bool csv_next(const char **current,
                                               const char *end, CsvRow *row) {
-  if (*current >= end)
+  if (unlikely(*current >= end))
     return false;
   row->col_count = 0;
   const char *ptr = *current;
   const char *tok_st = ptr;
+  bool in_quotes = false;
+
   __m256i commas = _mm256_set1_epi8(',');
   __m256i newlines = _mm256_set1_epi8('\n');
+  __m256i quotes = _mm256_set1_epi8('"');
 
   while (ptr < end) {
-    if (end - ptr >= 32) {
+    if (likely(!in_quotes) && end - ptr >= 32) {
       __m256i chunk = _mm256_loadu_si256((const __m256i *)ptr);
-      uint32_t msk = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, commas)) |
-                     _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, newlines));
+      uint32_t q_msk = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, quotes));
 
-      while (msk != 0) {
-        uint32_t ofst = __builtin_ctz(msk);
-        char c = ptr[ofst];
-        size_t len = (ptr + ofst) - tok_st;
-        if (len > 0 && tok_st[len - 1] == '\r')
-          len--;
+      if (likely(q_msk == 0)) { // FAST PATH: No Quotes in vector
+        uint32_t msk = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, commas)) |
+                       _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, newlines));
 
-        if (row->col_count < MAX_COLS)
-          row->cols[row->col_count++] = (StringView){tok_st, len};
+        while (msk != 0) {
+          uint32_t ofst = __builtin_ctz(msk);
+          char c = ptr[ofst];
+          size_t len = (ptr + ofst) - tok_st;
+          if (len > 0 && tok_st[len - 1] == '\r')
+            len--;
 
-        tok_st = ptr + ofst + 1;
+          if (row->col_count < MAX_COLS)
+            row->cols[row->col_count++] = (StringView){tok_st, len};
 
-        if (c == '\n') {
-          *current = ptr + ofst + 1;
-          return true;
+          tok_st = ptr + ofst + 1;
+
+          if (c == '\n') {
+            *current = ptr + ofst + 1;
+            return true;
+          }
+          msk &= msk - 1;
         }
-        msk &= msk - 1;
+        ptr += 32;
+        continue;
       }
-      ptr += 32;
-    } else {
-      char c = *ptr;
-      if (c == ',' || c == '\n') {
-        size_t len = ptr - tok_st;
-        if (len > 0 && tok_st[len - 1] == '\r')
-          len--;
-        if (row->col_count < MAX_COLS)
-          row->cols[row->col_count++] = (StringView){tok_st, len};
-        tok_st = ptr + 1;
-        if (c == '\n') {
-          *current = ptr + 1;
-          return true;
-        }
-      }
-      ptr++;
     }
+
+    // SCALAR FALLBACK: Handles quotes safely
+    char c = *ptr;
+    if (c == '"') {
+      in_quotes = !in_quotes;
+    } else if (!in_quotes && (c == ',' || c == '\n')) {
+      size_t len = ptr - tok_st;
+      if (len > 0 && tok_st[len - 1] == '\r')
+        len--;
+
+      const char *v_st = tok_st;
+      size_t v_len = len;
+      // Strip enclosing quotes for exact string view matching
+      if (v_len >= 2 && v_st[0] == '"' && v_st[v_len - 1] == '"') {
+        v_st++;
+        v_len -= 2;
+      }
+
+      if (row->col_count < MAX_COLS)
+        row->cols[row->col_count++] = (StringView){v_st, v_len};
+
+      tok_st = ptr + 1;
+      if (c == '\n') {
+        *current = ptr + 1;
+        return true;
+      }
+    }
+    ptr++;
   }
+
   if (tok_st < end && row->col_count < MAX_COLS) {
     size_t len = end - tok_st;
     if (len > 0 && tok_st[len - 1] == '\r')
       len--;
-    row->cols[row->col_count++] = (StringView){tok_st, len};
+    const char *v_st = tok_st;
+    size_t v_len = len;
+    if (v_len >= 2 && v_st[0] == '"' && v_st[v_len - 1] == '"') {
+      v_st++;
+      v_len -= 2;
+    }
+    row->cols[row->col_count++] = (StringView){v_st, v_len};
   }
   *current = end;
   return row->col_count > 0;
@@ -182,8 +232,7 @@ static inline uint64_t fmix64(uint64_t k) {
 
 static inline uint64_t combine_hashes(uint64_t h1, uint64_t h2) {
   uint64_t combined = h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
-  return fmix64(
-      combined); // Distribute bits to fix the key >> 56 partition clustering
+  return fmix64(combined);
 }
 
 static inline bool view_eq(StringView a, StringView b) {
@@ -234,7 +283,7 @@ void insert_partitioned(uint64_t key, CsvRow *row) {
   Partition *p = &prtns[part_idx];
 
   size_t slot = key & p->mask;
-  while (p->entries[slot].occupied)
+  while (unlikely(p->entries[slot].occupied))
     slot = (slot + 1) & p->mask;
 
   p->entries[slot].key = key;
@@ -250,21 +299,19 @@ static inline void print_joined_row(StringView *p_cols, int p_col_count,
   write_char(',');
   write_out(p_cols[p_k2].data, p_cols[p_k2].len);
 
-  // Prepend commas to avoid tracking trailing elements and buffer wrap-arounds
   for (int i = 0; i < p_col_count; ++i) {
-    if (i == p_k1 || i == p_k2)
+    if (unlikely(i == p_k1 || i == p_k2))
       continue;
     write_char(',');
     write_out(p_cols[i].data, p_cols[i].len);
   }
 
   for (int i = 0; i < q_row->col_count; ++i) {
-    if (i == q_k1 || i == q_k2)
+    if (unlikely(i == q_k1 || i == q_k2))
       continue;
     write_char(',');
     write_out(q_row->cols[i].data, q_row->cols[i].len);
   }
-
   write_char('\n');
 }
 
@@ -282,6 +329,19 @@ char *bulk_load_file_uring(const char *filename, size_t *out_size) {
   struct stat sb;
   fstat(fd, &sb);
   *out_size = sb.st_size;
+
+  // Memory Safeguard
+  long pages = sysconf(_SC_PHYS_PAGES);
+  long page_size = sysconf(_SC_PAGE_SIZE);
+  if (pages > 0 && page_size > 0) {
+    uint64_t total_mem = (uint64_t)pages * page_size;
+    if (sb.st_size > total_mem * 0.8) {
+      fprintf(stderr,
+              "WARNING: P.csv size (%ld bytes) exceeds 80%% of physical RAM. "
+              "May trigger OOM.\n",
+              sb.st_size);
+    }
+  }
 
   size_t alloc_size = (sb.st_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
   char *buf;
@@ -417,14 +477,14 @@ execute_join(const char *p_file, const char *q_file) {
   // Build Hash Map for P
   CsvRow row;
   while (csv_next(&p_ptr, p_end, &row)) {
-    if (row.col_count != header_p.col_count)
+    if (unlikely(row.col_count != header_p.col_count))
       continue;
     uint64_t key =
         combine_hashes(hash_view(row.cols[p_c1]), hash_view(row.cols[p_c2]));
     insert_partitioned(key, &row);
   }
 
-  // Stream and Probe Q (Deadlock Fixed)
+  // Stream and Probe Q
   off_t submit_offset = CHUNK_SIZE;
   off_t completed_offset = CHUNK_SIZE;
   int pending_reads = 0;
@@ -490,7 +550,7 @@ execute_join(const char *p_file, const char *q_file) {
     if (pending_reads == 0 && submit_offset >= q_file_size) {
       while (work_ptr < work_end) {
         if (csv_next(&work_ptr, work_end, &row)) {
-          if (row.col_count != header_q.col_count)
+          if (unlikely(row.col_count != header_q.col_count))
             continue;
           StringView qc1_v = row.cols[q_c1], qc2_v = row.cols[q_c2];
           uint64_t key = combine_hashes(hash_view(qc1_v), hash_view(qc2_v));
@@ -498,8 +558,8 @@ execute_join(const char *p_file, const char *q_file) {
           Partition *p = &prtns[part_idx];
 
           size_t slot = key & p->mask;
-          while (p->entries[slot].occupied) {
-            if (p->entries[slot].key == key) {
+          while (likely(p->entries[slot].occupied)) {
+            if (likely(p->entries[slot].key == key)) {
               StringView *matched =
                   &p_cell_arena[p->entries[slot].row_idx * p_cols_per_row];
               if (view_eq(matched[p_c1], qc1_v) &&
@@ -522,7 +582,7 @@ execute_join(const char *p_file, const char *q_file) {
 
       while (work_ptr <= last_newline) {
         if (csv_next(&work_ptr, last_newline + 1, &row)) {
-          if (row.col_count != header_q.col_count)
+          if (unlikely(row.col_count != header_q.col_count))
             continue;
           StringView qc1_v = row.cols[q_c1], qc2_v = row.cols[q_c2];
           uint64_t key = combine_hashes(hash_view(qc1_v), hash_view(qc2_v));
@@ -530,8 +590,8 @@ execute_join(const char *p_file, const char *q_file) {
           Partition *p = &prtns[part_idx];
 
           size_t slot = key & p->mask;
-          while (p->entries[slot].occupied) {
-            if (p->entries[slot].key == key) {
+          while (likely(p->entries[slot].occupied)) {
+            if (likely(p->entries[slot].key == key)) {
               StringView *matched =
                   &p_cell_arena[p->entries[slot].row_idx * p_cols_per_row];
               if (view_eq(matched[p_c1], qc1_v) &&
