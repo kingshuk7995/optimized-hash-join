@@ -23,3 +23,6 @@ clean:
 
 test: $(TARGET)
 	python3 test.py
+
+benchmark: $(TARGET)
+	python3 benchmark.py
