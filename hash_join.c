@@ -77,7 +77,7 @@ static inline void write_char(char c) {
   out_buf[out_pos++] = c;
 }
 
-// --- SIMD CSV Parsing & Hashing ---
+// SIMD CSV Parsing & Hashing
 
 // Optimized with native SIMD reduction (_mm256_sad_epu8)
 __attribute__((target("avx2"))) size_t count_rows_simd(const char *ptr,
@@ -110,7 +110,7 @@ __attribute__((target("avx2"))) size_t count_rows_simd(const char *ptr,
   return count;
 }
 
-// RFC 4180 Compliant with SIMD Fast Path
+// parsing with SIMD Fast Path
 __attribute__((target("avx2"))) bool csv_next(const char **current,
                                               const char *end, CsvRow *row) {
   if (unlikely(*current >= end))
@@ -250,12 +250,31 @@ typedef struct {
   HashEntry *entries;
   size_t capacity;
   size_t mask;
+  size_t count;
 } Partition;
 
 Partition prtns[NUM_PRTNS];
 StringView *p_cell_arena;
 int p_cols_per_row = 0;
 size_t p_pool_size = 0;
+
+void resize_partition(Partition *p) {
+  size_t new_cap = p->capacity * 2;
+  HashEntry *ne = calloc(new_cap, sizeof(HashEntry));
+  size_t new_mask = new_cap - 1;
+  for (size_t i = 0; i < p->capacity; i++) {
+    if (!p->entries[i].occupied)
+      continue;
+    size_t slot = p->entries[i].key & new_mask;
+    while (ne[slot].occupied)
+      slot = (slot + 1) & new_mask;
+    ne[slot] = p->entries[i];
+  }
+  free(p->entries);
+  p->entries = ne;
+  p->capacity = new_cap;
+  p->mask = new_mask;
+}
 
 void init_prtns(size_t exact_rows, int cols_per_row) {
   size_t cap_per_part = 1;
@@ -267,6 +286,7 @@ void init_prtns(size_t exact_rows, int cols_per_row) {
     prtns[i].capacity = cap_per_part;
     prtns[i].mask = cap_per_part - 1;
     prtns[i].entries = calloc(cap_per_part, sizeof(HashEntry));
+    prtns[i].count = 0;
   }
 
   p_cols_per_row = cols_per_row;
@@ -282,6 +302,10 @@ void insert_partitioned(uint64_t key, CsvRow *row) {
   uint32_t part_idx = key >> 56;
   Partition *p = &prtns[part_idx];
 
+  if (unlikely(p->count + 1 > p->capacity * 7 / 10)) {
+    resize_partition(p);
+  }
+
   size_t slot = key & p->mask;
   while (unlikely(p->entries[slot].occupied))
     slot = (slot + 1) & p->mask;
@@ -289,6 +313,7 @@ void insert_partitioned(uint64_t key, CsvRow *row) {
   p->entries[slot].key = key;
   p->entries[slot].row_idx = idx;
   p->entries[slot].occupied = true;
+  p->count++;
 }
 
 // Output Formatting
@@ -428,7 +453,8 @@ execute_join(const char *p_file, const char *q_file) {
   for (int i = 0; i < QUEUE_DEPTH; i++) {
     posix_memalign((void **)&q_io_bufs[i], ALIGNMENT, CHUNK_SIZE);
   }
-  char *q_work_buf = malloc(CHUNK_SIZE * 2);
+  size_t q_work_buf_size = CHUNK_SIZE * 2;
+  char *q_work_buf = malloc(q_work_buf_size);
 
   // Read first chunk of Q to get header
   struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
@@ -539,6 +565,16 @@ execute_join(const char *p_file, const char *q_file) {
           bytes_read = q_file_size - completed_offset;
         }
         completed_offset += bytes_read;
+
+        if (unlikely(tail_len + bytes_read > q_work_buf_size)) {
+          q_work_buf_size = tail_len + bytes_read + CHUNK_SIZE;
+          char *new_buf = realloc(q_work_buf, q_work_buf_size);
+          if (!new_buf) {
+            perror("realloc q_work_buf");
+            exit(1);
+          }
+          q_work_buf = new_buf;
+        }
         memcpy(q_work_buf + tail_len, q_io_bufs[buf_idx], bytes_read);
       }
     }
