@@ -7,24 +7,9 @@ Implemented a optimized disk based hash join utilizing io-uring for disk-IO and 
 
 On **WSL2**
 
-Output:
-kp ~/development/optimized-hash-join$ make benchmark
-python3 benchmark.py
-Generating data for benchmarking: P (2000000 rows), Q (1500000 rows)...
-Data generation complete.
-
-Starting benchmark with 5 iterations...
-Iteration 1/5... 0.4921 seconds
-Iteration 2/5... 0.3890 seconds
-Iteration 3/5... 0.3747 seconds
-Iteration 4/5... 0.3798 seconds
-Iteration 5/5... 0.3834 seconds
-
---- Benchmark Results ---
-Iterations: 5
-Min:    0.3747 s
-Max:    0.4921 s
-Mean:   0.4038 s
-Stdev:  0.0497 s
-
-Cleaning up temporary files...
+| Implementation      |    Min (s) |   Mean (s) |    Max (s) | Std Dev (s) | Speedup vs `mmap + linear` |
+| :------------------ | ---------: | ---------: | ---------: | ----------: | -------------------------: |
+| `mmap + linear`     | **0.5848** | **0.6084** | **0.6319** |  **0.0194** |                  **1.00×** |
+| `mmap + SIMD`       |     0.3770 |     0.3971 |     0.4308 |      0.0217 |                  **1.53×** |
+| `io_uring + linear` |     0.5618 |     0.5671 |     0.5742 |      0.0054 |                  **1.07×** |
+| `io_uring + SIMD`   | **0.3640** | **0.3691** | **0.3803** |  **0.0068** |                  **1.65×** |

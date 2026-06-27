@@ -23,7 +23,6 @@ def generate_data():
     if not os.path.exists("build"):
         os.makedirs("build")
 
-    # Generate P
     with open(P_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(["k1", "k2", "p_val1", "p_val2"])
@@ -35,7 +34,6 @@ def generate_data():
                 random.choice(["A", "B", "C", "D"])
             ])
 
-    # Generate Q
     with open(Q_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(["k1", "k2", "q_val1", "q_val2"])
@@ -48,40 +46,55 @@ def generate_data():
             ])
     print("Data generation complete.")
 
+def clear_page_cache():
+    try:
+        subprocess.run(['sudo', 'sh', '-c', 'sync; echo 3 > /proc/sys/vm/drop_caches'], check=True)
+    except subprocess.CalledProcessError:
+        print(" Warning: Could not clear page cache. Ensure you have passwordless sudo or run as root.")
+
 def run_benchmark():
     if not os.path.exists(BINARY_PATH):
         print(f"FATAL: Binary not found at {BINARY_PATH}")
         sys.exit(1)
 
-    times = []
+    combinations = [
+        ("mmap", "linear"),
+        ("mmap", "simd"),
+        ("uring", "linear"),
+        ("uring", "simd")
+    ]
+    
     print(f"\nStarting benchmark with {ITERATIONS} iterations...")
     
-    for i in range(ITERATIONS):
-        print(f"Iteration {i+1}/{ITERATIONS}...", end="", flush=True)
-        start_time = time.perf_counter()
-        
-        with open(OUT_FILE, "w") as f_out:
-            result = subprocess.run(
-                [BINARY_PATH, P_FILE, Q_FILE], stdout=f_out, stderr=subprocess.PIPE
-            )
+    for io_backend, parse_backend in combinations:
+        print(f"\n--- Benchmarking: {io_backend} + {parse_backend} ---")
+        times = []
+        for i in range(ITERATIONS):
+            print(f"Iteration {i+1}/{ITERATIONS}...", end="", flush=True)
+            clear_page_cache()
+            start_time = time.perf_counter()
             
-        end_time = time.perf_counter()
-        
-        if result.returncode != 0:
-            print(f" Execution failed!\nSTDERR:\n{result.stderr.decode()}")
-            sys.exit(result.returncode)
+            with open(OUT_FILE, "w") as f_out:
+                result = subprocess.run(
+                    [BINARY_PATH, io_backend, parse_backend, P_FILE, Q_FILE], stdout=f_out, stderr=subprocess.PIPE
+                )
+                
+            end_time = time.perf_counter()
             
-        exec_time = end_time - start_time
-        times.append(exec_time)
-        print(f" {exec_time:.4f} seconds")
+            if result.returncode != 0:
+                print(f" Execution failed!\nSTDERR:\n{result.stderr.decode()}")
+                sys.exit(result.returncode)
+                
+            exec_time = end_time - start_time
+            times.append(exec_time)
+            print(f" {exec_time:.4f} seconds")
 
-    print("\n--- Benchmark Results ---")
-    print(f"Iterations: {ITERATIONS}")
-    print(f"Min:    {min(times):.4f} s")
-    print(f"Max:    {max(times):.4f} s")
-    print(f"Mean:   {statistics.mean(times):.4f} s")
-    if ITERATIONS > 1:
-        print(f"Stdev:  {statistics.stdev(times):.4f} s")
+        print(f"\nResults for {io_backend} + {parse_backend}:")
+        print(f"Min:    {min(times):.4f} s")
+        print(f"Max:    {max(times):.4f} s")
+        print(f"Mean:   {statistics.mean(times):.4f} s")
+        if ITERATIONS > 1:
+            print(f"Stdev:  {statistics.stdev(times):.4f} s")
 
 def cleanup():
     print("\nCleaning up temporary files...")

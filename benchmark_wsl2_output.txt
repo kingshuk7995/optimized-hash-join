@@ -1,0 +1,64 @@
+python3 -m venv venv && ./venv/bin/pip install pandas numpy
+Requirement already satisfied: pandas in ./venv/lib/python3.14/site-packages (3.0.3)
+Requirement already satisfied: numpy in ./venv/lib/python3.14/site-packages (2.5.0)
+Requirement already satisfied: python-dateutil>=2.8.2 in ./venv/lib/python3.14/site-packages (from pandas) (2.9.0.post0)
+Requirement already satisfied: six>=1.5 in ./venv/lib/python3.14/site-packages (from python-dateutil>=2.8.2->pandas) (1.17.0)
+./venv/bin/python benchmark.py
+Generating data for benchmarking: P (2000000 rows), Q (1500000 rows)...
+Data generation complete.
+
+Starting benchmark with 5 iterations...
+
+--- Benchmarking: mmap + linear ---
+Iteration 1/5... 0.6319 seconds
+Iteration 2/5... 0.6231 seconds
+Iteration 3/5... 0.6070 seconds
+Iteration 4/5... 0.5848 seconds
+Iteration 5/5... 0.5950 seconds
+
+Results for mmap + linear:
+Min:    0.5848 s
+Max:    0.6319 s
+Mean:   0.6084 s
+Stdev:  0.0194 s
+
+--- Benchmarking: mmap + simd ---
+Iteration 1/5... 0.3892 seconds
+Iteration 2/5... 0.3770 seconds
+Iteration 3/5... 0.4308 seconds
+Iteration 4/5... 0.3827 seconds
+Iteration 5/5... 0.4059 seconds
+
+Results for mmap + simd:
+Min:    0.3770 s
+Max:    0.4308 s
+Mean:   0.3971 s
+Stdev:  0.0217 s
+
+--- Benchmarking: uring + linear ---
+Iteration 1/5... 0.5668 seconds
+Iteration 2/5... 0.5742 seconds
+Iteration 3/5... 0.5621 seconds
+Iteration 4/5... 0.5618 seconds
+Iteration 5/5... 0.5706 seconds
+
+Results for uring + linear:
+Min:    0.5618 s
+Max:    0.5742 s
+Mean:   0.5671 s
+Stdev:  0.0054 s
+
+--- Benchmarking: uring + simd ---
+Iteration 1/5... 0.3664 seconds
+Iteration 2/5... 0.3705 seconds
+Iteration 3/5... 0.3641 seconds
+Iteration 4/5... 0.3640 seconds
+Iteration 5/5... 0.3803 seconds
+
+Results for uring + simd:
+Min:    0.3640 s
+Max:    0.3803 s
+Mean:   0.3691 s
+Stdev:  0.0068 s
+
+Cleaning up temporary files...
